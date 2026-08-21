@@ -91,3 +91,12 @@ class GenerationResult:
     success: bool
     plan: Optional[WorkoutPlan] = None
     error: Optional[str] = None
+
+
+@dataclass
+class ExerciseSwapResult:
+    """Outcome of a call to swap_exercise — mirrors GenerationResult's shape."""
+
+    success: bool
+    exercise: Optional[Exercise] = None
+    error: Optional[str] = None

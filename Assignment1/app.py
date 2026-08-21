@@ -16,8 +16,8 @@ load_dotenv()
 
 import streamlit as st
 
-from workout_generator import generate_workout_plan
-from workout_models import WorkoutPlan, WorkoutRequest
+from workout_generator import generate_workout_plan, swap_exercise
+from workout_models import WorkoutDay, WorkoutPlan, WorkoutRequest
 
 GOAL_OPTIONS = ["Build muscle", "Lose fat", "General fitness", "Improve endurance"]
 EXPERIENCE_OPTIONS = ["Beginner", "Intermediate", "Advanced"]
@@ -30,6 +30,9 @@ def _init_session_state() -> None:
     st.session_state.setdefault("plan", None)
     st.session_state.setdefault("last_request", None)
     st.session_state.setdefault("error", None)
+    # Which day's expander should stay open across a rerun — reset to Day 1
+    # on a fresh generate/regenerate, pinned to the relevant day after a swap.
+    st.session_state.setdefault("expanded_day", 1)
 
 
 def _render_inputs() -> WorkoutRequest:
@@ -61,9 +64,27 @@ def _run_generation(request: WorkoutRequest, regenerate: bool = False) -> None:
         st.session_state["plan"] = result.plan
         st.session_state["last_request"] = request
         st.session_state["error"] = None
+        st.session_state["expanded_day"] = 1
     else:
         st.session_state["error"] = result.error
         # Keep any previously successful plan visible rather than wiping it out.
+
+
+def _run_swap(day: WorkoutDay, exercise_index: int) -> None:
+    request: WorkoutRequest = st.session_state["last_request"]
+    current_exercise = day.exercises[exercise_index]
+
+    with st.spinner(f"Finding an alternative to {current_exercise.name}..."):
+        result = swap_exercise(request, day.focus, current_exercise)
+
+    if result.success:
+        day.exercises[exercise_index] = result.exercise
+        st.session_state["error"] = None
+    else:
+        st.session_state["error"] = result.error
+
+    # Keep this day's card open so the swap (or the error) is visible.
+    st.session_state["expanded_day"] = day.day_number
 
 
 def _render_summary_bar(request: WorkoutRequest) -> None:
@@ -72,6 +93,18 @@ def _render_summary_bar(request: WorkoutRequest) -> None:
     cols[1].metric("Level", request.experience)
     cols[2].metric("Days/week", request.days_per_week)
     cols[3].metric("Equipment", ", ".join(request.equipment))
+
+
+def _render_exercise_row(day: WorkoutDay, ex_index: int) -> None:
+    ex = day.exercises[ex_index]
+    cols = st.columns([3, 1, 1, 3, 1])
+    cols[0].write(ex.name)
+    cols[1].write(ex.sets)
+    cols[2].write(ex.reps)
+    cols[3].write(ex.notes or "")
+    if cols[4].button("🔄", key=f"swap_{day.day_number}_{ex_index}", help="Swap this exercise"):
+        _run_swap(day, ex_index)
+        st.rerun()
 
 
 def _render_plan(plan: WorkoutPlan) -> None:
@@ -83,21 +116,18 @@ def _render_plan(plan: WorkoutPlan) -> None:
     if plan.summary:
         st.caption(plan.summary)
 
-    for i, day in enumerate(plan.days):
-        with st.expander(f"📅 Day {day.day_number}: {day.focus}", expanded=(i == 0)):
+    for day in plan.days:
+        expanded = day.day_number == st.session_state["expanded_day"]
+        with st.expander(f"📅 Day {day.day_number}: {day.focus}", expanded=expanded):
             if day.warm_up:
                 st.markdown(f"**🔥 Warm-up:** {day.warm_up}")
 
-            table_rows = [
-                {
-                    "Exercise": ex.name,
-                    "Sets": ex.sets,
-                    "Reps": ex.reps,
-                    "Notes": ex.notes or "",
-                }
-                for ex in day.exercises
-            ]
-            st.table(table_rows)
+            header = st.columns([3, 1, 1, 3, 1])
+            for col, label in zip(header, ["**Exercise**", "**Sets**", "**Reps**", "**Notes**", ""]):
+                col.markdown(label)
+
+            for ex_index in range(len(day.exercises)):
+                _render_exercise_row(day, ex_index)
 
             if day.cool_down:
                 st.markdown(f"**🧊 Cooldown:** {day.cool_down}")

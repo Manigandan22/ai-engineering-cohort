@@ -1,25 +1,48 @@
 """
 Core LLM-calling logic for the Workout Plan Generator.
 
-generate_workout_plan() is the single function the UI depends on: it takes
+generate_workout_plan() is the main entry point the UI depends on: it takes
 structured inputs, builds the prompt, calls the Groq API in strict JSON mode,
 parses the response into a WorkoutPlan, and always returns a
 GenerationResult — it never raises.
+
+swap_exercise() is a smaller sibling used by the "Swap this exercise"
+feature: it asks for a single replacement exercise rather than regenerating
+the whole plan.
 """
 
 import json
 import os
-from typing import Optional
+from typing import Optional, Tuple
 
 import groq
 
-from prompts import SYSTEM_PROMPT, WORKOUT_PLAN_SCHEMA, build_user_prompt
-from workout_models import Exercise, GenerationResult, WorkoutDay, WorkoutPlan, WorkoutRequest
+from prompts import (
+    EXERCISE_SWAP_SCHEMA,
+    SWAP_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    WORKOUT_PLAN_SCHEMA,
+    build_swap_user_prompt,
+    build_user_prompt,
+)
+from workout_models import (
+    Exercise,
+    ExerciseSwapResult,
+    GenerationResult,
+    WorkoutDay,
+    WorkoutPlan,
+    WorkoutRequest,
+)
 
 DEFAULT_MODEL_NAME = "openai/gpt-oss-120b"
 MODEL_NAME = os.environ.get("GROQ_MODEL", DEFAULT_MODEL_NAME)
 MAX_TOKENS = 2000
 TEMPERATURE = 0.7
+
+SWAP_MAX_TOKENS = 1000  # openai/gpt-oss-120b spends tokens on internal reasoning before
+# emitting the JSON itself, so even a single-exercise response needs real headroom —
+# a smaller budget (tested down to 300) reliably hit "max tokens reached" 400s.
+SWAP_TEMPERATURE = 0.9  # a bit more variety is desirable for "give me something different"
 
 VALID_GOALS = {"Build muscle", "Lose fat", "General fitness", "Improve endurance"}
 VALID_EXPERIENCE = {"Beginner", "Intermediate", "Advanced"}
@@ -60,6 +83,16 @@ def _get_client() -> groq.Groq:
     return groq.Groq(api_key=api_key)
 
 
+def _exercise_from_dict(data: dict) -> Exercise:
+    """Build an Exercise from a parsed JSON object. Raises on bad shape."""
+    return Exercise(
+        name=str(data["name"]),
+        sets=int(data["sets"]),
+        reps=str(data["reps"]),
+        notes=str(data.get("notes") or "") or None,
+    )
+
+
 def _parse_plan(raw_json: str) -> Optional[WorkoutPlan]:
     """
     Parse the model's JSON response into a WorkoutPlan.
@@ -79,15 +112,7 @@ def _parse_plan(raw_json: str) -> Optional[WorkoutPlan]:
                 focus=str(day["focus"]),
                 warm_up=str(day.get("warm_up", "")),
                 cool_down=str(day.get("cool_down", "")),
-                exercises=[
-                    Exercise(
-                        name=str(ex["name"]),
-                        sets=int(ex["sets"]),
-                        reps=str(ex["reps"]),
-                        notes=str(ex.get("notes") or "") or None,
-                    )
-                    for ex in day.get("exercises", [])
-                ],
+                exercises=[_exercise_from_dict(ex) for ex in day.get("exercises", [])],
             )
             for day in data.get("days", [])
         ]
@@ -106,74 +131,70 @@ def _parse_plan(raw_json: str) -> Optional[WorkoutPlan]:
     )
 
 
-def _attempt_generation(
-    client: groq.Groq, request: WorkoutRequest, regenerate: bool
-) -> "tuple[GenerationResult, bool]":
-    """
-    Make a single Groq API call and return (result, retryable).
+def _parse_exercise(raw_json: str) -> Optional[Exercise]:
+    """Parse the model's JSON response for a single exercise. Returns None on failure."""
+    try:
+        data = json.loads(raw_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
 
-    `retryable` is True for failures that are likely a one-off generation
-    glitch (empty/malformed JSON) rather than a systemic problem (bad key,
-    rate limit, network, deprecated model) — those aren't worth retrying
-    automatically.
-    """
-    user_prompt = build_user_prompt(request, regenerate=regenerate)
-    temperature = min(TEMPERATURE + 0.15, 1.0) if regenerate else TEMPERATURE
+    try:
+        return _exercise_from_dict(data)
+    except (KeyError, TypeError, ValueError):
+        return None
 
+
+def _call_groq_structured(
+    client: groq.Groq,
+    system_prompt: str,
+    user_prompt: str,
+    schema: dict,
+    temperature: float,
+    max_tokens: int,
+) -> Tuple[Optional[str], Optional[str], bool]:
+    """
+    Make one Groq structured-output call.
+
+    Returns (raw_json_content, error_message, retryable) — exactly one of
+    raw_json_content / error_message is non-None. `retryable` is True only
+    for failures that look like a one-off generation glitch (empty response,
+    or a schema-validation 400) rather than a systemic problem (bad key,
+    rate limit, network, deprecated model).
+    """
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=temperature,
-            max_tokens=MAX_TOKENS,
-            response_format={"type": "json_schema", "json_schema": WORKOUT_PLAN_SCHEMA},
+            max_tokens=max_tokens,
+            response_format={"type": "json_schema", "json_schema": schema},
         )
     except groq.AuthenticationError:
-        return GenerationResult(
-            success=False,
-            error="The Groq API key was rejected. Please check that GROQ_API_KEY is correct.",
-        ), False
+        return None, "The Groq API key was rejected. Please check that GROQ_API_KEY is correct.", False
     except groq.RateLimitError:
-        return GenerationResult(
-            success=False,
-            error="Groq's rate limit was hit. Please wait a moment and try again.",
-        ), False
+        return None, "Groq's rate limit was hit. Please wait a moment and try again.", False
     except groq.APITimeoutError:
-        return GenerationResult(
-            success=False,
-            error="The request to Groq timed out. Please try again.",
-        ), False
+        return None, "The request to Groq timed out. Please try again.", False
     except groq.APIConnectionError:
-        return GenerationResult(
-            success=False,
-            error="Couldn't reach the Groq API — please check your internet connection.",
-        ), False
+        return None, "Couldn't reach the Groq API — please check your internet connection.", False
     except groq.APIStatusError as exc:
         if exc.status_code == 404:
-            error_message = (
+            return None, (
                 f"The model '{MODEL_NAME}' wasn't found on Groq — it may have been "
                 "deprecated. Check https://console.groq.com/docs/models for a current "
-                "model ID and update MODEL_NAME in workout_generator.py."
-            )
-            return GenerationResult(success=False, error=error_message), False
+                "model ID and update GROQ_MODEL accordingly."
+            ), False
         if exc.status_code == 400:
             # Groq validates the model's JSON against our schema server-side and
             # returns 400 (code "json_validate_failed") when the generation
             # itself doesn't comply — an occasional model glitch, worth retrying.
-            return GenerationResult(
-                success=False,
-                error="The model returned a malformed plan. Please try generating again.",
-            ), True
-        error_message = f"Groq API returned an error (status {exc.status_code}). Please try again later."
-        return GenerationResult(success=False, error=error_message), False
+            return None, "The model returned a malformed response. Please try again.", True
+        return None, f"Groq API returned an error (status {exc.status_code}). Please try again later.", False
     except Exception:
-        return GenerationResult(
-            success=False,
-            error="Something unexpected went wrong while generating your plan. Please try again.",
-        ), False
+        return None, "Something unexpected went wrong. Please try again.", False
 
     try:
         raw_content = response.choices[0].message.content
@@ -181,10 +202,23 @@ def _attempt_generation(
         raw_content = None
 
     if not raw_content:
-        return GenerationResult(
-            success=False,
-            error="The model returned an empty response. Please try generating again.",
-        ), True
+        return None, "The model returned an empty response. Please try again.", True
+
+    return raw_content, None, False
+
+
+def _attempt_generation(
+    client: groq.Groq, request: WorkoutRequest, regenerate: bool
+) -> Tuple[GenerationResult, bool]:
+    """Make a single attempt at generating the full plan. Returns (result, retryable)."""
+    user_prompt = build_user_prompt(request, regenerate=regenerate)
+    temperature = min(TEMPERATURE + 0.15, 1.0) if regenerate else TEMPERATURE
+
+    raw_content, error, retryable = _call_groq_structured(
+        client, SYSTEM_PROMPT, user_prompt, WORKOUT_PLAN_SCHEMA, temperature, MAX_TOKENS
+    )
+    if error:
+        return GenerationResult(success=False, error=error), retryable
 
     plan = _parse_plan(raw_content)
     if plan is None:
@@ -234,5 +268,56 @@ def generate_workout_plan(request: WorkoutRequest, regenerate: bool = False) -> 
     result, retryable = _attempt_generation(client, request, regenerate)
     if not result.success and retryable:
         result, _ = _attempt_generation(client, request, regenerate)
+
+    return result
+
+
+def _attempt_swap(
+    client: groq.Groq, request: WorkoutRequest, day_focus: str, current_exercise: Exercise
+) -> Tuple[ExerciseSwapResult, bool]:
+    """Make a single attempt at swapping one exercise. Returns (result, retryable)."""
+    user_prompt = build_swap_user_prompt(request, day_focus, current_exercise)
+
+    raw_content, error, retryable = _call_groq_structured(
+        client, SWAP_SYSTEM_PROMPT, user_prompt, EXERCISE_SWAP_SCHEMA, SWAP_TEMPERATURE, SWAP_MAX_TOKENS
+    )
+    if error:
+        return ExerciseSwapResult(success=False, error=error), retryable
+
+    exercise = _parse_exercise(raw_content)
+    if exercise is None:
+        return ExerciseSwapResult(
+            success=False,
+            error="The model returned an unexpected response format. Please try swapping again.",
+        ), True
+
+    return ExerciseSwapResult(success=True, exercise=exercise), False
+
+
+def swap_exercise(request: WorkoutRequest, day_focus: str, current_exercise: Exercise) -> ExerciseSwapResult:
+    """
+    Ask the LLM for a single alternative to `current_exercise` within a day
+    of the given focus, respecting the same equipment/experience/limitation
+    constraints as the original plan.
+
+    Always returns an ExerciseSwapResult — never raises. Retries once on a
+    malformed/empty response, same policy as generate_workout_plan.
+    """
+    validation_error = validate_request(request)
+    if validation_error:
+        return ExerciseSwapResult(success=False, error=validation_error)
+
+    try:
+        client = _get_client()
+    except RuntimeError:
+        return ExerciseSwapResult(
+            success=False,
+            error="The app isn't configured with a Groq API key. "
+            "Set GROQ_API_KEY in your environment and restart the app.",
+        )
+
+    result, retryable = _attempt_swap(client, request, day_focus, current_exercise)
+    if not result.success and retryable:
+        result, _ = _attempt_swap(client, request, day_focus, current_exercise)
 
     return result

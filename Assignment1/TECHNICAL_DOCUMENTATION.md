@@ -63,6 +63,7 @@ and keeps the UI layer trivial to read.
 | `WorkoutDay` | `day_number, focus, warm_up, exercises, cool_down` | One `st.expander` card |
 | `WorkoutPlan` | `summary, days, disclaimer, rest_recovery_note` | The full parsed plan; has `.to_markdown()` for file export |
 | `GenerationResult` | `success, plan, error` | What `generate_workout_plan()` always returns |
+| `ExerciseSwapResult` | `success, exercise, error` | What `swap_exercise()` always returns |
 
 `WorkoutPlan.to_markdown()` reconstructs a Markdown document from the typed
 data — this is what powers the **Download plan (.md)** button. It is *not*
@@ -71,34 +72,44 @@ the same string the LLM produced; the LLM never produces Markdown anymore
 
 ### `prompts.py` — prompt templates and output schema
 
-- `SYSTEM_PROMPT` — fixed instructions (role, constraints, output contract, safety scope, tone). Loaded once per call as the `system` message.
-- `WORKOUT_PLAN_SCHEMA` — a JSON Schema dict passed to Groq as `response_format`. This is what actually enforces structure — see §3.
+- `SYSTEM_PROMPT` / `SWAP_SYSTEM_PROMPT` — fixed instructions for the full plan vs. a single-exercise swap. Loaded once per call as the `system` message.
+- `WORKOUT_PLAN_SCHEMA` / `EXERCISE_SWAP_SCHEMA` — JSON Schema dicts passed to Groq as `response_format`. This is what actually enforces structure — see §3.
 - `build_user_prompt(request, regenerate=False) -> str` — turns a `WorkoutRequest` into labeled key/value lines (not a prose sentence) plus explicit restatement of the day count and disclaimer requirement. Appends a "give a different variation" instruction when `regenerate=True`.
+- `build_swap_user_prompt(request, day_focus, current_exercise) -> str` — same labeled-lines approach, scoped to one exercise replacement (see §6).
 
 ### `workout_generator.py` — validation + Groq call + parsing
 
 - `validate_request(request) -> Optional[str]` — pure function, no network call. Returns an error string or `None`.
 - `_get_client() -> groq.Groq` — reads `GROQ_API_KEY` from the environment; raises `RuntimeError` if absent (caught by the caller).
-- `_parse_plan(raw_json) -> Optional[WorkoutPlan]` — `json.loads` + defensive field extraction; returns `None` on any parse/shape problem rather than raising.
-- `_attempt_generation(client, request, regenerate) -> (GenerationResult, retryable: bool)` — makes exactly one Groq call and classifies the outcome. `retryable=True` only for empty/malformed responses (see §5).
-- `generate_workout_plan(request, regenerate=False) -> GenerationResult` — the public entry point. Validates → gets client → calls `_attempt_generation` → retries once if `retryable` → returns.
+- `_call_groq_structured(client, system_prompt, user_prompt, schema, temperature, max_tokens) -> (raw_json, error, retryable)` — the single place that actually calls Groq and classifies every exception type (auth/rate-limit/timeout/connection/404/400/other). Shared by both the full-plan path and the swap path so this logic exists exactly once.
+- `_exercise_from_dict(data) -> Exercise` — shared field-extraction used by both `_parse_plan` and `_parse_exercise`.
+- `_parse_plan(raw_json) -> Optional[WorkoutPlan]` / `_parse_exercise(raw_json) -> Optional[Exercise]` — `json.loads` + defensive field extraction; return `None` on any parse/shape problem rather than raising.
+- `_attempt_generation(client, request, regenerate) -> (GenerationResult, retryable)` — one full-plan attempt.
+- `generate_workout_plan(request, regenerate=False) -> GenerationResult` — public entry point for the full plan. Validates → gets client → calls `_attempt_generation` → retries once if `retryable` → returns.
+- `_attempt_swap(client, request, day_focus, current_exercise) -> (ExerciseSwapResult, retryable)` — one swap attempt.
+- `swap_exercise(request, day_focus, current_exercise) -> ExerciseSwapResult` — public entry point for "Swap this exercise". Same validate → client → attempt → retry-once shape as `generate_workout_plan`.
 
 Module-level constants you'll tweak most often:
 ```python
-MODEL_NAME = "openai/gpt-oss-120b"
+DEFAULT_MODEL_NAME = "openai/gpt-oss-120b"
+MODEL_NAME = os.environ.get("GROQ_MODEL", DEFAULT_MODEL_NAME)
 MAX_TOKENS = 2000
 TEMPERATURE = 0.7
+SWAP_MAX_TOKENS = 1000
+SWAP_TEMPERATURE = 0.9
 ```
 
 ### `app.py` — Streamlit UI
 
 - `_render_inputs() -> WorkoutRequest` — the form (dropdowns, slider, text area).
-- `_run_generation(request, regenerate)` — calls `generate_workout_plan`, writes the result into `st.session_state`.
+- `_run_generation(request, regenerate)` — calls `generate_workout_plan`, writes the result into `st.session_state`, resets `expanded_day` to `1`.
+- `_run_swap(day, exercise_index)` — calls `swap_exercise`, mutates the specific `Exercise` in place inside `st.session_state["plan"]` on success, pins `expanded_day` to that day.
 - `_render_summary_bar(request)` — the 4-column metrics strip (Goal / Level / Days / Equipment).
-- `_render_plan(plan)` — renders the disclaimer as `st.warning`, each day as an `st.expander` with an `st.table` of exercises, and the rest/recovery note as `st.info`.
+- `_render_exercise_row(day, ex_index)` — one exercise as a 5-column row (Exercise / Sets / Reps / Notes / 🔄 swap button).
+- `_render_plan(plan)` — renders the disclaimer as `st.warning`, each day as an `st.expander` (open/closed driven by `expanded_day`) with a row per exercise, and the rest/recovery note as `st.info`.
 - `_render_output()` — renders any error (`st.error`) plus the plan (if present), and the Regenerate/Download buttons.
 
-`st.session_state` keys: `plan` (`WorkoutPlan | None`), `last_request` (`WorkoutRequest | None`), `error` (`str | None`). A failed generation does **not** clear a previously successful `plan` — the old plan stays visible with the new error shown above it.
+`st.session_state` keys: `plan` (`WorkoutPlan | None`), `last_request` (`WorkoutRequest | None`), `error` (`str | None`), `expanded_day` (`int` — which day's expander stays open across a rerun). A failed generation or swap does **not** clear a previously successful `plan` — the old plan stays visible with the new error shown above it.
 
 ---
 
@@ -276,11 +287,16 @@ print(result.plan.to_markdown() if result.success else result.error)
 | Schema-invalid generation (400, `json_validate_failed`) | `groq.APIStatusError`, `status_code == 400` | **Yes, once** | Only shown if the retry also fails |
 | Empty response content | after the call, before parsing | **Yes, once** | Only shown if the retry also fails |
 | Unparseable/malformed JSON | `_parse_plan()` returns `None` | **Yes, once** | Only shown if the retry also fails |
-| Any other unexpected exception | bare `except Exception` in `_attempt_generation` | No | "Something unexpected went wrong..." |
+| Any other unexpected exception | bare `except Exception` in `_call_groq_structured` | No | "Something unexpected went wrong..." |
+
+This table applies identically to `swap_exercise()` — it shares
+`_call_groq_structured()` and the same validate → retry-once shape, just
+producing an `ExerciseSwapResult` instead of a `GenerationResult`.
 
 Key invariant: **no raw exception or stack trace ever reaches the Streamlit
-UI.** Every path above terminates in a `GenerationResult(success=False,
-error=<string>)`, and `app.py` only ever calls `st.error(...)` on that string.
+UI.** Every path above terminates in a `GenerationResult`/`ExerciseSwapResult`
+with `success=False, error=<string>`, and `app.py` only ever calls
+`st.error(...)` on that string.
 
 The 400/empty/malformed cases retry because they were observed live during
 development to be transient model-generation glitches (see git history /
@@ -290,21 +306,50 @@ network, wrong model) is a systemic condition a retry won't fix.
 
 ---
 
-## 6. Extending the app (stretch-goal notes)
+## 6. Stretch goals — all implemented
 
-Already implemented: session-state persistence, Regenerate, Markdown download.
+All four optional stretch goals from the assignment are implemented:
 
-**"Swap this exercise" (not yet implemented)** — sketch of the approach if
-you build it: add a small "🔄 Swap" button next to each exercise row inside
-the `st.table`/loop in `_render_plan()`. On click, call a new
-`workout_generator.regenerate_exercise(day, exercise, request) -> Exercise`
-that sends a narrowly-scoped prompt ("suggest one alternative exercise for
-X, same muscle group, same equipment/limitation constraints") and returns a
-single `Exercise`, not a full plan — this avoids the cost and risk of
-regenerating the whole week to change one line. You'd need a schema for a
-single exercise object (a small subset of `WORKOUT_PLAN_SCHEMA`) and to
-mutate the specific `Exercise` in `st.session_state["plan"]` in place before
-`st.rerun()`.
+- **Session-state persistence** — the last plan survives reruns via `st.session_state`.
+- **Regenerate** — asks for a different variation of the full plan (see §4 for how temperature/prompt change for this).
+- **Download as `.md`** — via `WorkoutPlan.to_markdown()`.
+- **"Swap this exercise"** — described below.
+
+### How "Swap this exercise" works
+
+Rather than regenerating the whole week to change one line, each exercise
+row gets its own "🔄" button (`_render_exercise_row()` in `app.py`). Clicking
+it calls `workout_generator.swap_exercise(request, day_focus,
+current_exercise) -> ExerciseSwapResult` — a narrowly-scoped call that asks
+for exactly one replacement exercise, not a full plan:
+
+- **Prompt/schema** (`prompts.py`): `SWAP_SYSTEM_PROMPT` + `EXERCISE_SWAP_SCHEMA`
+  — a small single-object schema (`name`, `sets`, `reps`, `notes`), reusing
+  the same shape as one exercise entry in `WORKOUT_PLAN_SCHEMA`.
+  `build_swap_user_prompt()` sends the day's focus, the user's
+  equipment/experience/limitations, and the exercise being replaced.
+- **Call plumbing** (`workout_generator.py`): both `generate_workout_plan`
+  and `swap_exercise` now share a `_call_groq_structured()` helper for the
+  actual Groq call + exception handling, so the auth/rate-limit/network/404/400
+  handling logic (see §5) isn't duplicated between them. `swap_exercise`
+  gets the same one-time-retry-on-malformed-response policy as the main
+  generator.
+- **State update** (`app.py`'s `_run_swap()`): on success, the specific
+  `Exercise` object inside `st.session_state["plan"].days[...].exercises[...]`
+  is replaced in place, and `expanded_day` is set to that day's number so
+  the card stays open across the `st.rerun()` instead of collapsing back to
+  Day 1.
+
+⚠️ **Token budget gotcha (found during live testing):** `openai/gpt-oss-120b`
+is a reasoning model — it spends completion tokens on internal reasoning
+before emitting the final JSON, even for a tiny one-exercise response. An
+initial `SWAP_MAX_TOKENS = 300` reliably failed with a 400
+(`"max completion tokens reached before generating a valid document"`)
+because the model ran out of budget mid-reasoning, before ever writing the
+JSON. Raised to `1000` and verified working live. If you swap to a
+different/smaller model, this budget may be reducible; if you swap to
+another reasoning model, don't assume a small schema means a small token
+budget is safe — test it explicitly first.
 
 ---
 

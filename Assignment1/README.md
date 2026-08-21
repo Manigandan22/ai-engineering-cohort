@@ -85,9 +85,12 @@ tweaking the LLM's prompt/schema/model, see
   treats this, along with an empty/unparseable response, as retryable and
   automatically retries the call once before showing a friendly fallback
   message, so a transient bad generation is invisible to the user.
-- **Stretch goals implemented:** last plan persists via `st.session_state`,
-  a "Regenerate" button asks for a different variation, and a download
-  button exports the plan as `.md`.
+- **Stretch goals implemented (all four):** last plan persists via
+  `st.session_state`; a "Regenerate" button asks for a different variation;
+  a download button exports the plan as `.md`; and each exercise row has a
+  "🔄 Swap" button that asks the LLM for a single alternative exercise
+  (same muscle group, same equipment/limitation constraints) without
+  regenerating the whole week.
 
 ## Notes on model choice
 

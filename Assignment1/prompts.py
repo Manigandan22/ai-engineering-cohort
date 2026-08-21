@@ -10,7 +10,7 @@ Markdown — this is what lets the UI render real per-day cards and exercise
 tables instead of parsing a wall of text.
 """
 
-from workout_models import WorkoutRequest
+from workout_models import Exercise, WorkoutRequest
 
 
 SYSTEM_PROMPT = """You are an experienced, safety-conscious certified personal trainer who writes \
@@ -147,5 +147,69 @@ def build_user_prompt(request: WorkoutRequest, regenerate: bool = False) -> str:
             "profile — vary exercise selection, ordering, or set/rep schemes — "
             "while still fully respecting every constraint above."
         )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# "Swap this exercise" — a narrowly-scoped prompt/schema for replacing a
+# single exercise, rather than regenerating the whole plan.
+# ---------------------------------------------------------------------------
+
+SWAP_SYSTEM_PROMPT = """You are an experienced, safety-conscious certified personal trainer. The \
+user wants ONE alternative exercise to replace a single exercise in an existing workout day — not \
+a new plan.
+
+Suggest one different exercise that:
+   - Targets the same muscle group / movement pattern as the original exercise, so it still fits \
+that day's focus.
+   - Uses only the user's available equipment — never assume equipment they don't have.
+   - Is appropriate for the user's experience level.
+   - Actively avoids aggravating any injuries or limitations the user reported.
+   - Is NOT the same exercise as the one being replaced.
+
+Respond with JSON only, matching the required schema exactly: "name" (exercise name), integer \
+"sets", "reps" as a string (e.g. "8-10"), and "notes" (a short string — use an empty string if \
+there's nothing to note, or briefly explain the substitution if it was made because of a \
+limitation). Do not include any text outside the JSON object.
+"""
+
+# JSON Schema for a single exercise object — a subset of WORKOUT_PLAN_SCHEMA's
+# per-exercise shape, reused here so a swap only asks for what it needs.
+EXERCISE_SWAP_SCHEMA = {
+    "name": "exercise_swap",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "sets": {"type": "integer"},
+            "reps": {"type": "string"},
+            "notes": {"type": "string"},
+        },
+        "required": ["name", "sets", "reps", "notes"],
+        "additionalProperties": False,
+    },
+}
+
+
+def build_swap_user_prompt(request: WorkoutRequest, day_focus: str, current_exercise: Exercise) -> str:
+    """Build the prompt for replacing a single exercise within a workout day."""
+    limitations = request.limitations.strip() if request.limitations else ""
+    equipment = ", ".join(request.equipment) if isinstance(request.equipment, list) else request.equipment
+
+    lines = [
+        "Suggest one alternative exercise to replace the following, for this client:",
+        "",
+        f"- Day focus: {day_focus}",
+        f"- Experience level: {request.experience}",
+        f"- Equipment access: {equipment}",
+        f"- Injuries / limitations: {limitations if limitations else 'None reported'}",
+        "",
+        "Exercise to replace:",
+        f"- {current_exercise.name} — {current_exercise.sets} sets x {current_exercise.reps} reps",
+        "",
+        "Give exactly one replacement exercise that still fits this day's focus.",
+    ]
 
     return "\n".join(lines)
