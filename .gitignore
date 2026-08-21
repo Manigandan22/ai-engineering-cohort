@@ -1,0 +1,8 @@
+# Root-level rules applied across every AssignmentN/ subfolder.
+# Individual assignments may also have their own local .gitignore.
+**/.env
+**/__pycache__/
+**/*.pyc
+**/venv/
+**/.venv/
+**/.streamlit/secrets.toml
