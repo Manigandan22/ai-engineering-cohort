@@ -93,7 +93,7 @@ Module-level constants you'll tweak most often:
 ```python
 DEFAULT_MODEL_NAME = "openai/gpt-oss-120b"
 MODEL_NAME = os.environ.get("GROQ_MODEL", DEFAULT_MODEL_NAME)
-MAX_TOKENS = 2000
+MAX_TOKENS = 6000
 TEMPERATURE = 0.7
 SWAP_MAX_TOKENS = 1000
 SWAP_TEMPERATURE = 0.9
@@ -172,9 +172,24 @@ imports, `GROQ_MODEL` from `.env` will silently stop being picked up.
 ### 4.2 Adjust creativity / length
 
 ```python
-MAX_TOKENS = 2000     # raise if plans get cut off for 6-7 day requests
+MAX_TOKENS = 6000     # raise further if plans still get cut off for heavy requests
 TEMPERATURE = 0.7      # lower = more consistent/conservative, higher = more varied
 ```
+⚠️ **This isn't just a cost/length knob — set it too low and generation fails
+outright.** `openai/gpt-oss-120b` is a reasoning model: it spends a real
+chunk of the completion budget on internal reasoning tokens *before* writing
+any JSON, and that reasoning grows with plan complexity. `MAX_TOKENS = 2000`
+(the original default) was found live to **reliably fail** (4/4 repeated
+attempts) for a 7-day plan with limitations text — the response got
+truncated mid-JSON, missing required fields like `disclaimer` and
+`rest_recovery_note`, and Groq rejected it with a 400
+(`json_validate_failed`). Since both attempts of the automatic retry hit the
+same truncation, this wasn't a transient glitch — it failed every time,
+surfacing to the user as "The model returned a malformed response." Checking
+`response.usage.completion_tokens_details.reasoning_tokens` on a raw call is
+the fastest way to see how much headroom a given `MAX_TOKENS` actually
+leaves before you ship a change here.
+
 `_attempt_generation` already bumps temperature by `+0.15` (capped at `1.0`)
 automatically when `regenerate=True`, so the "different variation" button has
 something to work with beyond the prompt instruction alone.

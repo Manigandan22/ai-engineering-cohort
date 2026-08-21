@@ -36,7 +36,14 @@ from workout_models import (
 
 DEFAULT_MODEL_NAME = "openai/gpt-oss-120b"
 MODEL_NAME = os.environ.get("GROQ_MODEL", DEFAULT_MODEL_NAME)
-MAX_TOKENS = 2000
+# openai/gpt-oss-120b is a reasoning model: a meaningful chunk of every
+# completion is spent on internal reasoning tokens before the JSON is ever
+# written, and that reasoning grows with plan complexity (more days, more
+# constraints from limitations text). A 2000-token budget was found to
+# reliably truncate 7-day plans with limitations before all required JSON
+# fields were emitted (observed completion usage up to ~3100 tokens, with
+# 1800+ of that being reasoning) — 6000 leaves real headroom above that.
+MAX_TOKENS = 6000
 TEMPERATURE = 0.7
 
 SWAP_MAX_TOKENS = 1000  # openai/gpt-oss-120b spends tokens on internal reasoning before
